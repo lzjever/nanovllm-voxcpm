@@ -321,6 +321,7 @@ class AsyncVoxCPM2Server:
         self.process.start()
         loop = asyncio.get_running_loop()
         self._fatal_error: str | None = None
+        self._fatal_event = asyncio.Event()
         self._stopping = False
         self._init_fut: asyncio.Future[None] = loop.create_future()
         self.op_table: dict[str, asyncio.Future[Any]] = {}
@@ -335,6 +336,20 @@ class AsyncVoxCPM2Server:
         )
         self._queue_out_thread.start()
         self.recv_task: asyncio.Task = asyncio.create_task(self.recv_queue())
+
+    def _set_fatal(self, error: str) -> None:
+        if self._fatal_error is not None:
+            return
+        self._fatal_error = error
+        self._fatal_event.set()
+        if not self._init_fut.done():
+            self._init_fut.set_exception(RuntimeError(error))
+        for fut in self.op_table.values():
+            if not fut.done():
+                fut.set_exception(RuntimeError(error))
+        self.op_table.clear()
+        for stream in self.stream_table.values():
+            stream.put_nowait(RuntimeError(error))
 
     def _queue_out_bridge(self, loop: asyncio.AbstractEventLoop) -> None:
         while not self._queue_out_stop.is_set():
@@ -375,19 +390,10 @@ class AsyncVoxCPM2Server:
                         self._init_fut.set_result(None)
                     continue
                 if res.get("type") == "init_error":
-                    if not self._init_fut.done():
-                        self._init_fut.set_exception(RuntimeError(res.get("error", "unknown init error")))
-                    continue
+                    self._set_fatal(res.get("error", "unknown init error"))
+                    return
                 if res.get("type") == "fatal_error":
-                    self._fatal_error = res.get("error", "unknown server error")
-                    if not self._init_fut.done():
-                        self._init_fut.set_exception(RuntimeError(self._fatal_error))
-                    for fut in self.op_table.values():
-                        if not fut.done():
-                            fut.set_exception(RuntimeError(self._fatal_error))
-                    self.op_table.clear()
-                    for stream in self.stream_table.values():
-                        await stream.put(RuntimeError(self._fatal_error))
+                    self._set_fatal(res.get("error", "unknown server error"))
                     return
 
                 if res["type"] == "stream":
@@ -434,6 +440,11 @@ class AsyncVoxCPM2Server:
                 break
             await asyncio.sleep(0.05)
         await self._init_fut
+
+    async def wait_for_fatal(self) -> None:
+        await self._fatal_event.wait()
+        assert self._fatal_error is not None
+        raise RuntimeError(self._fatal_error)
 
     async def encode_latents(self, wav: bytes, wav_format: str, role: LatentRole = "prompt") -> bytes:
         return await self.submit("encode_latents", wav, wav_format, role)
@@ -562,6 +573,18 @@ class AsyncVoxCPM2ServerPool:
 
     async def wait_for_ready(self):
         await asyncio.gather(*[server.wait_for_ready() for server in self.servers])
+
+    async def wait_for_fatal(self) -> None:
+        if len(self.servers) == 0:
+            raise RuntimeError("server pool is empty")
+        waiters = [asyncio.create_task(server.wait_for_fatal()) for server in self.servers]
+        try:
+            done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            await next(waiter for waiter in waiters if waiter in done)
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
 
     async def stop(self):
         await asyncio.gather(*[server.stop() for server in self.servers])

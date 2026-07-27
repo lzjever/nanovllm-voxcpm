@@ -839,6 +839,7 @@ async def _async_server_fatal_error_unblocks_active_stream():
     server.op_table = {"pending": pending}
     server.stream_table = {"seq": asyncio.Queue()}
     server._fatal_error = None
+    server._fatal_event = asyncio.Event()
     recv_task = asyncio.create_task(server.recv_queue())
 
     await server._queue_out_async.put({"type": "fatal_error", "error": "engine failed"})
@@ -856,6 +857,88 @@ async def _async_server_fatal_error_unblocks_active_stream():
 
 def test_async_server_fatal_error_unblocks_active_stream():
     asyncio.run(_async_server_fatal_error_unblocks_active_stream())
+
+
+async def _async_server_wait_for_fatal_is_sticky():
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+
+    server = object.__new__(AsyncVoxCPM2Server)
+    server._queue_out_async = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    server._init_fut = loop.create_future()
+    server._init_fut.set_result(None)
+    server.op_table = {}
+    server.stream_table = {}
+    server._fatal_error = None
+    server._fatal_event = asyncio.Event()
+    recv_task = asyncio.create_task(server.recv_queue())
+    waiter = asyncio.create_task(server.wait_for_fatal())
+
+    await server._queue_out_async.put({"type": "fatal_error", "error": "engine failed"})
+
+    with pytest.raises(RuntimeError, match="engine failed"):
+        await asyncio.wait_for(waiter, timeout=0.1)
+    with pytest.raises(RuntimeError, match="engine failed"):
+        await asyncio.wait_for(server.wait_for_fatal(), timeout=0.1)
+    await recv_task
+
+
+def test_async_server_wait_for_fatal_is_sticky():
+    asyncio.run(_async_server_wait_for_fatal_is_sticky())
+
+
+async def _async_server_init_error_signals_fatal():
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+
+    server = object.__new__(AsyncVoxCPM2Server)
+    server._queue_out_async = asyncio.Queue()
+    server._init_fut = asyncio.get_running_loop().create_future()
+    server.op_table = {}
+    server.stream_table = {}
+    server._fatal_error = None
+    server._fatal_event = asyncio.Event()
+    recv_task = asyncio.create_task(server.recv_queue())
+
+    await server._queue_out_async.put({"type": "init_error", "error": "model load failed"})
+
+    with pytest.raises(RuntimeError, match="model load failed"):
+        await server._init_fut
+    with pytest.raises(RuntimeError, match="model load failed"):
+        await asyncio.wait_for(server.wait_for_fatal(), timeout=0.1)
+    await recv_task
+
+
+def test_async_server_init_error_signals_fatal():
+    asyncio.run(_async_server_init_error_signals_fatal())
+
+
+async def _pool_wait_for_fatal_raises_first_failure_and_cancels_other_waiters():
+    class _FatalServer(_FakeServer):
+        def __init__(self, error=None):
+            super().__init__()
+            self.error = error
+            self.cancelled = False
+
+        async def wait_for_fatal(self):
+            if self.error is not None:
+                raise RuntimeError(self.error)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled = True
+
+    waiting_server = _FatalServer()
+    failed_server = _FatalServer("worker failed")
+    pool = _make_pool([waiting_server, failed_server])
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        await pool.wait_for_fatal()
+
+    assert waiting_server.cancelled is True
+
+
+def test_pool_wait_for_fatal_raises_first_failure_and_cancels_other_waiters():
+    asyncio.run(_pool_wait_for_fatal_raises_first_failure_and_cancels_other_waiters())
 
 
 async def _async_server_generate_raises_fatal_without_cancel():
@@ -914,7 +997,8 @@ def test_main_loop_reports_step_exception_as_fatal(monkeypatch):
     assert "step failed" in messages[-1]["error"]
 
 
-def test_queue_bridge_reports_unexpected_child_exit():
+@pytest.mark.parametrize("stopping", [False, True])
+def test_queue_bridge_reports_only_unexpected_child_exit(stopping):
     from queue import Empty
 
     from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
@@ -941,12 +1025,16 @@ def test_queue_bridge_reports_unexpected_child_exit():
     server = object.__new__(AsyncVoxCPM2Server)
     server.queue_out = _EmptyQueue()
     server.process = type("_Process", (), {"exitcode": 17})()
+    server._stopping = stopping
     server._queue_out_stop = _Stop()
     server._queue_out_async = asyncio.Queue()
     loop = _Loop()
 
     server._queue_out_bridge(loop)
 
-    message = server._queue_out_async.get_nowait()
-    assert message["type"] == "fatal_error"
-    assert "exitcode=17" in message["error"]
+    if stopping:
+        assert server._queue_out_async.empty()
+    else:
+        message = server._queue_out_async.get_nowait()
+        assert message["type"] == "fatal_error"
+        assert "exitcode=17" in message["error"]
