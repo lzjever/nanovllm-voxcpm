@@ -518,9 +518,11 @@ class AsyncVoxCPM2Server:
                     raise data
                 yield data
         finally:
-            if not is_normal_exit and getattr(self, "_fatal_error", None) is None:
-                await self.submit("cancel", seq_id)
-            self.stream_table.pop(seq_id, None)
+            try:
+                if not is_normal_exit and getattr(self, "_fatal_error", None) is None:
+                    await self.submit("cancel", seq_id)
+            finally:
+                self.stream_table.pop(seq_id, None)
 
 
 class AsyncVoxCPM2ServerPool:
@@ -662,8 +664,10 @@ class AsyncVoxCPM2ServerPool:
             async for data in inner_stream:
                 yield data
         finally:
-            await inner_stream.aclose()
-            self.servers_load[min_load_server_idx] -= 1
+            try:
+                await inner_stream.aclose()
+            finally:
+                self.servers_load[min_load_server_idx] -= 1
 
 
 class SyncVoxCPM2ServerPool:
@@ -704,9 +708,9 @@ class SyncVoxCPM2ServerPool:
         self.loop.close()
         self.loop = None
 
-    def encode_latents(self, wav: bytes, wav_format: str, role: LatentRole = "prompt"):
+    def encode_latents(self, wav: bytes, wav_format: str):
         assert self.loop is not None
-        return self.loop.run_until_complete(self.server_pool.encode_latents(wav, wav_format, role))
+        return self.loop.run_until_complete(self.server_pool.encode_latents(wav, wav_format))
 
     def get_model_info(self) -> ModelInfoResponse:
         assert self.loop is not None

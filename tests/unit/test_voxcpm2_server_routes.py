@@ -750,6 +750,33 @@ def test_async_server_generate_cancels_when_consumer_closes_early():
     asyncio.run(_async_server_generate_cancels_when_consumer_closes_early())
 
 
+async def _async_server_generate_cleans_stream_state_when_cancel_fails():
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+
+    server = object.__new__(AsyncVoxCPM2Server)
+    server.stream_table = {}
+    server._fatal_error = None
+
+    async def submit(command, *args):
+        if command == "add_request":
+            await server.stream_table[args[0]].put(np.array([1.0], dtype=np.float32))
+        else:
+            raise RuntimeError("cancel failed")
+
+    server.submit = submit
+    stream = server.generate("hello")
+
+    await stream.__anext__()
+    with pytest.raises(RuntimeError, match="cancel failed"):
+        await stream.aclose()
+
+    assert server.stream_table == {}
+
+
+def test_async_server_generate_cleans_stream_state_when_cancel_fails():
+    asyncio.run(_async_server_generate_cleans_stream_state_when_cancel_fails())
+
+
 async def _pool_generate_closes_inner_stream_on_outer_close():
     class _CloseAwareServer(_FakeServer):
         def __init__(self):
@@ -776,6 +803,28 @@ async def _pool_generate_closes_inner_stream_on_outer_close():
 
 def test_pool_generate_closes_inner_stream_on_outer_close():
     asyncio.run(_pool_generate_closes_inner_stream_on_outer_close())
+
+
+async def _pool_generate_releases_load_when_inner_close_fails():
+    class _FailingCloseServer(_FakeServer):
+        async def generate(self, *args, **kwargs):
+            try:
+                yield np.array([1.0], dtype=np.float32)
+            finally:
+                raise RuntimeError("close failed")
+
+    pool = _make_pool([_FailingCloseServer()])
+    stream = pool.generate("hello")
+
+    await stream.__anext__()
+    with pytest.raises(RuntimeError, match="close failed"):
+        await stream.aclose()
+
+    assert pool.servers_load.tolist() == [0]
+
+
+def test_pool_generate_releases_load_when_inner_close_fails():
+    asyncio.run(_pool_generate_releases_load_when_inner_close_fails())
 
 
 async def _async_server_fatal_error_unblocks_active_stream():
