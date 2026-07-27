@@ -23,7 +23,6 @@ dependencies = [
     "pydantic",    
     "flash_attn ; sys_platform != 'win32'",
     "soundfile>=0.13.1",
-    "torchcodec",
 ]
 
 [project.urls]

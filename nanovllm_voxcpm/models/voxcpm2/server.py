@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import io
 import os
+import signal
 import threading
 import time
 import traceback
@@ -30,6 +31,7 @@ class GenerationCompletion(TypedDict):
 
 
 GenerationStreamItem = Waveform | GenerationCompletion
+GenerationQueueItem = GenerationStreamItem | RuntimeError | None
 
 
 def _make_generation_completion(seq: Any) -> GenerationCompletion:
@@ -206,8 +208,6 @@ class VoxCPM2ServerImpl:
 
 
 def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
-    import signal
-
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         coalesce_ms = float(os.environ.get("NANOVLLM_QUEUE_COALESCE_MS", "2"))
@@ -266,7 +266,11 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
             if states["is_stoped"]:
                 break
 
-            output = srv.step()
+            try:
+                output = srv.step()
+            except Exception:
+                queue_out.put({"type": "fatal_error", "error": traceback.format_exc()})
+                return
             for seq in output:
                 latest_waveform = seq.custom_payload.generated_waveforms[-1]
                 queue_out.put({"type": "stream", "id": seq.seq_id, "data": latest_waveform})
@@ -316,9 +320,11 @@ class AsyncVoxCPM2Server:
         )
         self.process.start()
         loop = asyncio.get_running_loop()
+        self._fatal_error: str | None = None
+        self._stopping = False
         self._init_fut: asyncio.Future[None] = loop.create_future()
         self.op_table: dict[str, asyncio.Future[Any]] = {}
-        self.stream_table: dict[str, asyncio.Queue[GenerationStreamItem | None]] = {}
+        self.stream_table: dict[str, asyncio.Queue[GenerationQueueItem]] = {}
         self._queue_out_async: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._queue_out_stop = threading.Event()
         self._queue_out_thread = threading.Thread(
@@ -335,8 +341,24 @@ class AsyncVoxCPM2Server:
             try:
                 res = self.queue_out.get(timeout=0.1)
             except Empty:
+                if self.process.exitcode is not None and not getattr(self, "_stopping", False):
+                    with contextlib.suppress(RuntimeError):
+                        loop.call_soon_threadsafe(
+                            self._queue_out_async.put_nowait,
+                            {
+                                "type": "fatal_error",
+                                "error": f"server process exited unexpectedly: exitcode={self.process.exitcode}",
+                            },
+                        )
+                    return
                 continue
             except (EOFError, OSError, ValueError):
+                if not getattr(self, "_stopping", False):
+                    with contextlib.suppress(RuntimeError):
+                        loop.call_soon_threadsafe(
+                            self._queue_out_async.put_nowait,
+                            {"type": "fatal_error", "error": "server process connection closed unexpectedly"},
+                        )
                 return
             try:
                 loop.call_soon_threadsafe(self._queue_out_async.put_nowait, res)
@@ -356,6 +378,17 @@ class AsyncVoxCPM2Server:
                     if not self._init_fut.done():
                         self._init_fut.set_exception(RuntimeError(res.get("error", "unknown init error")))
                     continue
+                if res.get("type") == "fatal_error":
+                    self._fatal_error = res.get("error", "unknown server error")
+                    if not self._init_fut.done():
+                        self._init_fut.set_exception(RuntimeError(self._fatal_error))
+                    for fut in self.op_table.values():
+                        if not fut.done():
+                            fut.set_exception(RuntimeError(self._fatal_error))
+                    self.op_table.clear()
+                    for stream in self.stream_table.values():
+                        await stream.put(RuntimeError(self._fatal_error))
+                    return
 
                 if res["type"] == "stream":
                     if res["id"] in self.stream_table:
@@ -373,6 +406,8 @@ class AsyncVoxCPM2Server:
             return
 
     async def submit(self, cmd: str, *args: object, **kwargs: object) -> Any:
+        if self._fatal_error is not None:
+            raise RuntimeError(self._fatal_error)
         op_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[Any] = loop.create_future()
@@ -404,6 +439,7 @@ class AsyncVoxCPM2Server:
         return await self.submit("encode_latents", wav, wav_format, role)
 
     async def stop(self) -> None:
+        self._stopping = True
         graceful_stop = False
         if self.process.exitcode is None and self.process.is_alive():
             try:
@@ -478,11 +514,13 @@ class AsyncVoxCPM2Server:
                 if data is None:
                     is_normal_exit = True
                     break
+                if isinstance(data, RuntimeError):
+                    raise data
                 yield data
         finally:
-            if not is_normal_exit:
+            if not is_normal_exit and getattr(self, "_fatal_error", None) is None:
                 await self.submit("cancel", seq_id)
-            del self.stream_table[seq_id]
+            self.stream_table.pop(seq_id, None)
 
 
 class AsyncVoxCPM2ServerPool:
@@ -609,20 +647,22 @@ class AsyncVoxCPM2ServerPool:
         min_load_server_idx = np.argmin(self.servers_load)
         self.servers_load[min_load_server_idx] += 1
         server = self.servers[min_load_server_idx]
+        inner_stream = server.generate(
+            target_text,
+            prompt_latents,
+            prompt_text,
+            max_generate_length,
+            temperature,
+            cfg_value,
+            ref_audio_latents,
+            lora_name,
+            seed,
+        )
         try:
-            async for data in server.generate(
-                target_text,
-                prompt_latents,
-                prompt_text,
-                max_generate_length,
-                temperature,
-                cfg_value,
-                ref_audio_latents,
-                lora_name,
-                seed,
-            ):
+            async for data in inner_stream:
                 yield data
         finally:
+            await inner_stream.aclose()
             self.servers_load[min_load_server_idx] -= 1
 
 

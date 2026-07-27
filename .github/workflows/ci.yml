@@ -68,7 +68,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # torchcodec must match torch 1:1 (see upstream compatibility table).
           # We keep Python at 3.11 here to minimize wheel-matrix variance.
           #
           # CUDA coverage:
@@ -78,42 +77,36 @@ jobs:
           - python-version: "3.11"
             torch-version: "2.5"
             torchaudio-version: "2.5"
-            torchcodec-version: "0.1"
             cuda-image: "12.4.1-devel-ubuntu20.04"
             torch-extra-index: "https://download.pytorch.org/whl/cu124"
 
           - python-version: "3.11"
             torch-version: "2.7"
             torchaudio-version: "2.7"
-            torchcodec-version: "0.5"
             cuda-image: "12.6.3-cudnn-devel-ubuntu22.04"
             torch-extra-index: "https://download.pytorch.org/whl/cu126"
 
           - python-version: "3.11"
             torch-version: "2.8"
             torchaudio-version: "2.8"
-            torchcodec-version: "0.7"
             cuda-image: "12.6.3-cudnn-devel-ubuntu22.04"
             torch-extra-index: "https://download.pytorch.org/whl/cu126"
 
           - python-version: "3.12"
             torch-version: "2.9"
             torchaudio-version: "2.9"
-            torchcodec-version: "0.9"
             cuda-image: "12.6.3-cudnn-devel-ubuntu22.04"
             torch-extra-index: "https://download.pytorch.org/whl/cu126"
 
           - python-version: "3.12"
             torch-version: "2.9"
             torchaudio-version: "2.9"
-            torchcodec-version: "0.9"
             cuda-image: "13.0.2-devel-ubuntu24.04"
             torch-extra-index: "https://download.pytorch.org/whl/cu130"
 
           - python-version: "3.12"
             torch-version: "2.10"
             torchaudio-version: "2.10"
-            torchcodec-version: "0.10"
             cuda-image: "13.0.2-devel-ubuntu24.04"
             torch-extra-index: "https://download.pytorch.org/whl/cu130"
 
@@ -155,15 +148,14 @@ jobs:
           rm -rf /var/lib/apt/lists/*
 
       - name: Pin torch stack (uv add)
-        # Override torch/torchaudio/torchcodec versions for this matrix entry.
+        # Override torch/torchaudio versions for this matrix entry.
         # This updates pyproject.toml and generates/updates uv.lock within the CI workspace.
         run: |
           uv add --no-sync \
             --index ${{ matrix.torch-extra-index }} \
             --default-index https://pypi.org/simple \
             "torch==${{ matrix.torch-version }}" \
-            "torchaudio==${{ matrix.torchaudio-version }}" \
-            "torchcodec==${{ matrix.torchcodec-version }}"
+            "torchaudio==${{ matrix.torchaudio-version }}"
 
       - name: Install flash-attn build deps
         # flash-attn may build from source; ensure common build-time imports exist.
