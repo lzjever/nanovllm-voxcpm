@@ -18,10 +18,26 @@ from typing_extensions import Literal, TypedDict
 
 from nanovllm_voxcpm.config import Config
 from nanovllm_voxcpm.models.voxcpm2.config import LoRAConfig, VoxCPM2Config
-from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
+from nanovllm_voxcpm.models.voxcpm2.engine import LatentRole, VoxCPM2Engine
 from nanovllm_voxcpm.models.voxcpm2.runner import VoxCPM2Runner
 
 Waveform = NDArray[np.float32]
+
+
+class GenerationCompletion(TypedDict):
+    type: Literal["completion"]
+    generated_latents: bytes
+
+
+GenerationStreamItem = Waveform | GenerationCompletion
+
+
+def _make_generation_completion(seq: Any) -> GenerationCompletion:
+    generated_latents = np.concatenate(seq.custom_payload.generated_latents, axis=0)
+    return GenerationCompletion(
+        type="completion",
+        generated_latents=generated_latents.astype(np.float32, copy=False).tobytes(),
+    )
 
 
 class HealthResponse(TypedDict):
@@ -102,14 +118,14 @@ class VoxCPM2ServerImpl:
             model_path=str(self.model_path),
         )
 
-    def encode_latents(self, wav: bytes, wav_format: str) -> bytes:
+    def encode_latents(self, wav: bytes, wav_format: str, role: LatentRole = "prompt") -> bytes:
         wav_np, _ = librosa.load(io.BytesIO(wav), sr=self.encoder_sample_rate, mono=False)
         wav_tensor = torch.from_numpy(wav_np)
         if wav_tensor.ndim == 1:
             wav_tensor = wav_tensor.unsqueeze(0)
         if wav_tensor.size(0) > 1:
             wav_tensor = wav_tensor.mean(dim=0, keepdim=True)
-        latents = self.llm.encode_latents(wav_tensor)
+        latents = self.llm.encode_latents(wav_tensor, role=role)
         assert latents.shape[0] % self.llm.patch_size == 0
         return latents.tobytes()
 
@@ -255,6 +271,7 @@ def main_loop(queue_in: mp.Queue, queue_out: mp.Queue, args, kwargs):
                 latest_waveform = seq.custom_payload.generated_waveforms[-1]
                 queue_out.put({"type": "stream", "id": seq.seq_id, "data": latest_waveform})
                 if seq.is_finished:
+                    queue_out.put({"type": "stream", "id": seq.seq_id, "data": _make_generation_completion(seq)})
                     queue_out.put({"type": "stream", "id": seq.seq_id, "data": None})
 
 
@@ -301,7 +318,7 @@ class AsyncVoxCPM2Server:
         loop = asyncio.get_running_loop()
         self._init_fut: asyncio.Future[None] = loop.create_future()
         self.op_table: dict[str, asyncio.Future[Any]] = {}
-        self.stream_table: dict[str, asyncio.Queue[Waveform | None]] = {}
+        self.stream_table: dict[str, asyncio.Queue[GenerationStreamItem | None]] = {}
         self._queue_out_async: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._queue_out_stop = threading.Event()
         self._queue_out_thread = threading.Thread(
@@ -383,8 +400,8 @@ class AsyncVoxCPM2Server:
             await asyncio.sleep(0.05)
         await self._init_fut
 
-    async def encode_latents(self, wav: bytes, wav_format: str) -> bytes:
-        return await self.submit("encode_latents", wav, wav_format)
+    async def encode_latents(self, wav: bytes, wav_format: str, role: LatentRole = "prompt") -> bytes:
+        return await self.submit("encode_latents", wav, wav_format, role)
 
     async def stop(self) -> None:
         graceful_stop = False
@@ -438,7 +455,7 @@ class AsyncVoxCPM2Server:
         ref_audio_latents: bytes | None = None,
         lora_name: str | None = None,
         seed: int | None = None,
-    ) -> AsyncGenerator[Waveform, None]:
+    ) -> AsyncGenerator[GenerationStreamItem, None]:
         seq_id = gen_uuid()
         self.stream_table[seq_id] = asyncio.Queue()
         is_normal_exit = False
@@ -509,9 +526,9 @@ class AsyncVoxCPM2ServerPool:
     async def stop(self):
         await asyncio.gather(*[server.stop() for server in self.servers])
 
-    async def encode_latents(self, wav: bytes, wav_format: str):
+    async def encode_latents(self, wav: bytes, wav_format: str, role: LatentRole = "prompt"):
         min_load_server_idx = np.argmin(self.servers_load)
-        return await self.servers[min_load_server_idx].encode_latents(wav, wav_format)
+        return await self.servers[min_load_server_idx].encode_latents(wav, wav_format, role)
 
     async def get_model_info(self) -> ModelInfoResponse:
         if len(self.servers) == 0:
@@ -520,7 +537,7 @@ class AsyncVoxCPM2ServerPool:
 
     async def add_prompt(self, wav: bytes, wav_format: str, prompt_text: str):
         prompt_id = gen_uuid()
-        prompt_latents = await self.encode_latents(wav, wav_format)
+        prompt_latents = await self.encode_latents(wav, wav_format, role="prompt")
         self._prompt_pool[prompt_id] = {"latents": prompt_latents, "text": prompt_text}
         return prompt_id
 
@@ -647,9 +664,9 @@ class SyncVoxCPM2ServerPool:
         self.loop.close()
         self.loop = None
 
-    def encode_latents(self, wav: bytes, wav_format: str):
+    def encode_latents(self, wav: bytes, wav_format: str, role: LatentRole = "prompt"):
         assert self.loop is not None
-        return self.loop.run_until_complete(self.server_pool.encode_latents(wav, wav_format))
+        return self.loop.run_until_complete(self.server_pool.encode_latents(wav, wav_format, role))
 
     def get_model_info(self) -> ModelInfoResponse:
         assert self.loop is not None

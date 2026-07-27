@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 import torch
@@ -13,6 +14,9 @@ from nanovllm_voxcpm.models.voxcpm2.runner import RunnerTask, VoxCPM2Payload, Vo
 from nanovllm_voxcpm.models.voxcpm2.utils import mask_multichar_chinese_tokens
 
 
+LatentRole = Literal["reference", "prompt"]
+
+
 @dataclass
 class VoxCPM2SeqPayload:
     feats: list[np.ndarray]
@@ -21,6 +25,7 @@ class VoxCPM2SeqPayload:
     generated_waveforms: list[np.ndarray]
     temperature: float
     cfg_value: float
+    generated_latents: list[np.ndarray] = field(default_factory=list)
     decode_pad: np.ndarray | None = None
     max_generate_length: int | None = None
     seed: int | None = None
@@ -99,6 +104,7 @@ class VoxCPM2Engine(LLMEngineBase):
         if seq.custom_payload.seed is not None and seq.custom_payload.seed >= 0:
             seq.custom_payload.seed_step += 1
         seq.custom_payload.generated_waveforms.append(waveforms)
+        seq.custom_payload.generated_latents.append(latents)
 
         latents = latents.reshape(-1, self.feat_dim)
         if seq.custom_payload.decode_pad is not None:
@@ -198,6 +204,7 @@ class VoxCPM2Engine(LLMEngineBase):
                 cfg_value=cfg_value,
                 max_generate_length=max_generate_length,
                 generated_waveforms=[],
+                generated_latents=[],
                 seed=seed,
                 seed_step=0,
             ),
@@ -206,10 +213,18 @@ class VoxCPM2Engine(LLMEngineBase):
         )
         self.add_sequence(seq)
 
-    def encode_latents(self, wav: torch.Tensor, align_size: int = -1) -> np.ndarray:
+    def encode_latents(
+        self,
+        wav: torch.Tensor,
+        align_size: int = -1,
+        role: LatentRole = "prompt",
+    ) -> np.ndarray:
+        if role not in ("reference", "prompt"):
+            raise ValueError(f"Unknown latent role: {role}")
         if align_size == -1:
             align_size = self.patch_size * self.model_runner.vae.encoder_chunk_size
         if wav.size(1) % align_size != 0:
             remained = align_size - wav.size(1) % align_size
-            wav = torch.nn.functional.pad(wav, (remained, 0))
+            pad = (0, remained) if role == "reference" else (remained, 0)
+            wav = torch.nn.functional.pad(wav, pad)
         return self.model_runner.encode_latents(wav)

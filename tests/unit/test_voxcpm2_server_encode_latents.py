@@ -14,8 +14,9 @@ def test_encode_latents_uses_librosa_resample(monkeypatch):
     class _FakeLLM:
         patch_size = 1
 
-        def encode_latents(self, wav_tensor):
+        def encode_latents(self, wav_tensor, role):
             captured["wav_tensor"] = wav_tensor
+            captured["role"] = role
             return np.zeros((2, 4), dtype=np.float32)
 
     server = VoxCPM2ServerImpl.__new__(VoxCPM2ServerImpl)
@@ -42,6 +43,7 @@ def test_encode_latents_uses_librosa_resample(monkeypatch):
     assert captured["mono"] is False
     assert tuple(captured["wav_tensor"].shape) == (1, 3)
     assert captured["wav_tensor"].device.type == "cpu"
+    assert captured["role"] == "prompt"
 
 
 def test_get_model_info_uses_output_sample_rate():

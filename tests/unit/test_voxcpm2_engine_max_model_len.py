@@ -98,3 +98,34 @@ def test_postprocess_advances_seed_step_after_generated_latent():
     )
 
     assert seq.custom_payload.seed_step == 3
+    assert len(seq.custom_payload.generated_latents) == 1
+    assert seq.custom_payload.generated_latents[0].shape == (engine.patch_size, engine.feat_dim)
+
+
+def test_completion_contains_only_generated_segment_latents():
+    import numpy as np
+
+    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2SeqPayload
+    from nanovllm_voxcpm.models.voxcpm2.server import _make_generation_completion
+
+    prompt = np.full((3, 4), -1.0, dtype=np.float32)
+    generated = [
+        np.full((1, 4), 1.0, dtype=np.float32),
+        np.full((1, 4), 2.0, dtype=np.float32),
+    ]
+    payload = VoxCPM2SeqPayload(
+        feats=[np.concatenate([prompt, *generated], axis=0)],
+        text_tokens=[],
+        feat_masks=[],
+        generated_waveforms=[],
+        generated_latents=generated,
+        temperature=1.0,
+        cfg_value=1.0,
+    )
+    seq = type("_Seq", (), {"custom_payload": payload})()
+
+    completion = _make_generation_completion(seq)
+    decoded = np.frombuffer(completion["generated_latents"], dtype=np.float32).reshape(-1, 4)
+
+    assert completion["type"] == "completion"
+    assert decoded.tolist() == [[1.0] * 4, [2.0] * 4]

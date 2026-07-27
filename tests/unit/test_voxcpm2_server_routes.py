@@ -26,7 +26,7 @@ class _FakeServer:
         self.registered: list[tuple[str, str]] = []
         self.unregistered: list[str] = []
         self.generate_calls: list[dict] = []
-        self.encode_calls: list[tuple[bytes, str]] = []
+        self.encode_calls: list[tuple[bytes, str, str]] = []
 
     async def register_lora(self, name: str, path: str):
         self.registered.append((name, path))
@@ -47,8 +47,8 @@ class _FakeServer:
             "model_path": "/fake",
         }
 
-    async def encode_latents(self, wav: bytes, wav_format: str) -> bytes:
-        self.encode_calls.append((wav, wav_format))
+    async def encode_latents(self, wav: bytes, wav_format: str, role: str = "prompt") -> bytes:
+        self.encode_calls.append((wav, wav_format, role))
         return np.zeros((4,), dtype=np.float32).tobytes()
 
     async def generate(
@@ -303,8 +303,9 @@ def test_encode_latents_converts_stereo_to_mono(monkeypatch):
     class _LLM:
         patch_size = 1
 
-        def encode_latents(self, wav_tensor):
+        def encode_latents(self, wav_tensor, role):
             captured["shape"] = wav_tensor.shape
+            captured["role"] = role
             return np.zeros((2, 4), dtype=np.float32)
 
     srv.llm = _LLM()
@@ -319,6 +320,7 @@ def test_encode_latents_converts_stereo_to_mono(monkeypatch):
 
     # Stereo → mono: channel dim should become 1.
     assert captured["shape"][0] == 1
+    assert captured["role"] == "prompt"
 
 
 def test_encode_latents_mono_keeps_shape(monkeypatch):
@@ -332,9 +334,10 @@ def test_encode_latents_mono_keeps_shape(monkeypatch):
     class _LLM:
         patch_size = 1
 
-        def encode_latents(self, wav_tensor):
+        def encode_latents(self, wav_tensor, role):
             captured["ndim"] = wav_tensor.ndim
             captured["shape"] = wav_tensor.shape
+            captured["role"] = role
             return np.zeros((2, 4), dtype=np.float32)
 
     srv.llm = _LLM()
@@ -349,6 +352,7 @@ def test_encode_latents_mono_keeps_shape(monkeypatch):
     assert isinstance(out, bytes)
     # After unsqueeze the tensor should be (1, N).
     assert captured["shape"][0] == 1
+    assert captured["role"] == "prompt"
 
 
 # ---------------------------------------------------------------------------
@@ -470,9 +474,9 @@ async def _pool_encode_latents_routes_to_min_load():
     pool = _make_pool([s0, s1])
     pool.servers_load[0] = 5  # s1 has lower load
 
-    out = await pool.encode_latents(b"data", "wav")
+    out = await pool.encode_latents(b"data", "wav", role="reference")
     assert isinstance(out, bytes)
-    assert len(s1.encode_calls) == 1
+    assert s1.encode_calls == [(b"data", "wav", "reference")]
     assert len(s0.encode_calls) == 0
 
 
@@ -691,7 +695,7 @@ def test_async_server_forwards_control_plane_calls():
 
 
 async def _async_server_generate_completes_and_cleans_stream_state():
-    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2Server, GenerationCompletion
 
     server = object.__new__(AsyncVoxCPM2Server)
     server.stream_table = {}
@@ -702,14 +706,16 @@ async def _async_server_generate_completes_and_cleans_stream_state():
         if command == "add_request":
             stream = server.stream_table[args[0]]
             await stream.put(np.array([1.0], dtype=np.float32))
+            await stream.put(GenerationCompletion(type="completion", generated_latents=b"latents"))
             await stream.put(None)
 
     server.submit = submit
 
     chunks = [chunk async for chunk in server.generate("hello")]
 
-    assert len(chunks) == 1
+    assert len(chunks) == 2
     assert chunks[0].tolist() == [1.0]
+    assert chunks[1] == {"type": "completion", "generated_latents": b"latents"}
     assert commands == ["add_request"]
     assert server.stream_table == {}
 

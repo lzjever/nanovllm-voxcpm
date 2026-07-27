@@ -43,7 +43,14 @@ def test_audio_vae_v2_uses_fixed_batch_shaped_sr_idx():
     assert sr_idx.tolist() == [3, 3, 3]
 
 
-def test_voxcpm2_engine_aligns_prompt_audio_with_encoder_chunk_size():
+@pytest.mark.parametrize(
+    ("role", "expected"),
+    [
+        ("prompt", [0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0]),
+        ("reference", [0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0]),
+    ],
+)
+def test_voxcpm2_engine_aligns_audio_by_role(role, expected):
     from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
 
     captured = {}
@@ -63,10 +70,19 @@ def test_voxcpm2_engine_aligns_prompt_audio_with_encoder_chunk_size():
         },
     )()
 
-    wav = torch.zeros(1, 5)
-    engine.encode_latents(wav)
+    wav = torch.arange(5, dtype=torch.float32).unsqueeze(0)
+    engine.encode_latents(wav, role=role)
 
-    assert captured["wav"].shape[-1] == 8
+    assert captured["wav"].tolist() == [expected]
+
+
+def test_voxcpm2_engine_rejects_unknown_audio_role():
+    from nanovllm_voxcpm.models.voxcpm2.engine import VoxCPM2Engine
+
+    engine = VoxCPM2Engine.__new__(VoxCPM2Engine)
+
+    with pytest.raises(ValueError, match="Unknown latent role"):
+        engine.encode_latents(torch.zeros(1, 1), role="unknown")
 
 
 def test_voxcpm2_runner_slices_decoded_waveform_with_decoder_chunk_size(monkeypatch):
