@@ -8,7 +8,7 @@ import time
 import traceback
 import uuid
 from queue import Empty
-from typing import Any, AsyncGenerator, List, Optional, cast
+from typing import Any, AsyncGenerator, List, NoReturn, Optional, cast
 
 import librosa
 import numpy as np
@@ -441,7 +441,7 @@ class AsyncVoxCPM2Server:
             await asyncio.sleep(0.05)
         await self._init_fut
 
-    async def wait_for_fatal(self) -> None:
+    async def wait_for_fatal(self) -> NoReturn:
         await self._fatal_event.wait()
         assert self._fatal_error is not None
         raise RuntimeError(self._fatal_error)
@@ -574,7 +574,7 @@ class AsyncVoxCPM2ServerPool:
     async def wait_for_ready(self):
         await asyncio.gather(*[server.wait_for_ready() for server in self.servers])
 
-    async def wait_for_fatal(self) -> None:
+    async def wait_for_fatal(self) -> NoReturn:
         if len(self.servers) == 0:
             raise RuntimeError("server pool is empty")
         waiters = [asyncio.create_task(server.wait_for_fatal()) for server in self.servers]
